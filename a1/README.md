@@ -2,7 +2,7 @@
 
 ## Performance
 
-The result that I obtained from assignment 1 was {xx}.
+The result that I obtained from assignment 1 was 98% (73.50 / 75).
 
 ## Premise
 
