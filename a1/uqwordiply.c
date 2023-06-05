@@ -1,6 +1,6 @@
 // uqwordiply.c
 //
-// By Quinn Horton [46975919]
+// By Quinn Horton
 //
 // The main file for UQ Wordiply, the first assignment task for CSSE2310 in
 // semester 1, 2023.
