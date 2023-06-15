@@ -7,6 +7,7 @@
 #include <crypt.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <signal.h>
 #include <csse2310a4.h>
 #include "cracka4.h"
 
@@ -34,15 +35,6 @@ typedef struct {
     uint16_t port;
 } Socket;
 
-/* Stores information that a client thread needs to know.
- */
-typedef struct {
-    int fd;
-    WordArray* dict;
-    sem_t* writeProtect;
-    int* liveConn;
-} Client;
-
 /* Contains the information needed for cracking threads.
  */
 typedef struct {
@@ -52,6 +44,7 @@ typedef struct {
     char* salt;
     char* encryption;
     char** dict;
+    int* cryptCalls;
 } Cracking;
 
 /* Used to store and protect the global statistics output in the event of a
@@ -68,16 +61,35 @@ typedef struct {
     int cryptFuncRequests;
 } Statistics;
 
+/* Stores information that a client thread needs to know.
+ */
+typedef struct {
+    int fd;
+    WordArray* dict;
+    Statistics* stats;
+} Client;
+
+/* Stores the information to be passed into the signal handling thread
+ */
+typedef struct {
+    sigset_t* set;
+    Statistics* stats;
+} SigHandle;
+
 // Function declarations
 bool is_pos_int(char* string); 
 bool are_args_valid(int argc, char** argv);
 ArgVals* extract_cla(int argc, char** argv);
 WordArray* parse_dict(FILE* dict);
 Socket* open_port(char* port);
-void connection_handler(int listenFd, int maxConn, WordArray* dict);
-void talk_to_client(FILE* read, FILE* write, WordArray* dict);
+void connection_handler(int listenFd, int maxConn, WordArray* dict,
+	Statistics* stats);
+void talk_to_client(FILE* read, FILE* write, WordArray* dict,
+	Statistics* stats);
 void* new_client_thread(void* clientPtr);
-char* crypt_crack(char* encrypted, int numThreads, WordArray* dict);
+char* crypt_crack(char* encrypted, int numThreads, WordArray* dict,
+	Statistics* stats);
+void create_stat_thread(Statistics* stats);
 
 // Constants
 #define MAX_ARGS 7
@@ -102,5 +114,15 @@ char* crypt_crack(char* encrypted, int numThreads, WordArray* dict);
 #define ERR_DICT "crackserver: unable to open dictionary file \"%s\"\n"
 #define ERR_DICT_NO_WORDS "crackserver: no plain text words to test\n"
 #define ERR_PORT "crackserver: unable to open socket for listening\n"
+
+// Statistics message
+#define STAT_MSG "\
+Connected clients: %d\n\
+Completed clients: %d\n\
+Crack requests: %d\n\
+Failed crack requests: %d\n\
+Successful crack requests: %d\n\
+Crypt requests: %d\n\
+crypt()/crypt_r() calls: %d\n"
 
 #endif

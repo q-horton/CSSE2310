@@ -8,6 +8,11 @@
 #include "crackserver.h"
 
 int main(int argc, char** argv) {
+    // Creates signal handling thread
+    Statistics* stats = malloc(sizeof(Statistics));
+    stats->writeProtect = malloc(sizeof(sem_t));
+    create_stat_thread(stats);
+    
     // Checks commandline arguments
     if (!are_args_valid(argc, argv)) {
 	fprintf(stderr, ERR_USAGE);
@@ -32,7 +37,7 @@ int main(int argc, char** argv) {
     Socket* socket = open_port(args->port);
     fprintf(stderr, "%d\n", socket->port);
     fflush(stderr);
-    connection_handler(socket->sock, args->maxConn, dictWords);
+    connection_handler(socket->sock, args->maxConn, dictWords, stats);
     return 0;
 }
 
@@ -191,8 +196,6 @@ Socket* open_port(char* port) {
 
     // Opens socket
     int serv = socket(AF_INET, SOCK_STREAM, 0);
-    //int v = 1;
-    //setsockopt(serv, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
     if (bind(serv, ai->ai_addr, sizeof(struct sockaddr))) {
         fprintf(stderr, ERR_PORT);
         exit(4);
@@ -227,25 +230,23 @@ Socket* open_port(char* port) {
  *	requests.
  *  maxConn: The maximum amount of connections that may exist at any one time.
  *  dict: The dictionary of words to test against when decrypting a string.
+ *  stats: The summary statistics that the server tracks.
  *
  *  REF: CSSE2310 2023 Semester 1, week 8 lecture code samples.
  */
-void connection_handler(int listenFd, int maxConn, WordArray* dict) {
-    sem_t writeProtect;
-    sem_init(&writeProtect, 0, 1);
-    int liveConnections = 0;
+void connection_handler(int listenFd, int maxConn, WordArray* dict,
+	Statistics* stats) {
     while(true) {
-	if (!maxConn || liveConnections < maxConn) {
+	if (!maxConn || stats->clientsConnected < maxConn) {
 	    int fd = accept(listenFd, 0, 0);
-	    sem_wait(&writeProtect);
-	    liveConnections++;
-	    sem_post(&writeProtect);
+	    sem_wait(stats->writeProtect);
+	    (stats->clientsConnected)++;
+	    sem_post(stats->writeProtect);
 	    if (fd >= 0) {
 		Client* clientPtr = malloc(sizeof(Client));
 		clientPtr->fd = fd;
 		clientPtr->dict = dict;
-		clientPtr->writeProtect = &writeProtect;
-		clientPtr->liveConn = &liveConnections;
+		clientPtr->stats = stats;
 		pthread_t threadId;
 		pthread_create(&threadId, NULL, new_client_thread, clientPtr);
 		pthread_detach(threadId);
@@ -329,21 +330,42 @@ bool is_valid_command(char** command) {
  *  read: The file pointer to read in client messages.
  *  write: The file pointer to write messages back to the client.
  *  dict: The dictionary of words used in decrypting a string.
+ *  stats: The summary statistics tracked by the server.
  */
-void talk_to_client(FILE* read, FILE* write, WordArray* dict) {
+void talk_to_client(FILE* read, FILE* write, WordArray* dict,
+	Statistics* stats) {
     char* client;
     while ((client = read_line(read))) {
 	char** command = split_by_char(client, ' ', COMM_ARGC);
+	if (!strcmp(command[0], "crypt")) {
+	    sem_wait(stats->writeProtect);
+	    (stats->cryptRequests)++;
+	    sem_post(stats->writeProtect);
+	} else if (!strcmp(command[0], "crack")) {
+	    sem_wait(stats->writeProtect);
+	    (stats->totalCrackRequests)++;
+	    sem_post(stats->writeProtect);
+	}
 	if (is_valid_command(command)) {
 	    if (!strcmp(command[0], "crypt")) {
 		char* encrypted = crypt(command[1], command[2]);
+		sem_wait(stats->writeProtect);
+		(stats->cryptFuncRequests)++;
+		sem_post(stats->writeProtect);
 		fprintf(write, "%s\n", encrypted);
 	    } else if (!strcmp(command[0], "crack")) {
 		int numThreads = atoi(command[2]);
-		char* plaintext = crypt_crack(command[1], numThreads, dict);
+		char* plaintext = crypt_crack(command[1], numThreads, dict,
+			stats);
 		if (plaintext) {
+		    sem_wait(stats->writeProtect);
+		    (stats->succCrackRequests)++;
+		    sem_post(stats->writeProtect);
 		    fprintf(write, "%s\n", plaintext);
 		} else {
+		    sem_wait(stats->writeProtect);
+		    (stats->unCrackRequests)++;
+		    sem_post(stats->writeProtect);
 		    fprintf(write, ":failed\n");
 		}
 	    }
@@ -369,12 +391,13 @@ void* new_client_thread(void* clientPtr) {
     int fd2 = dup(client.fd);
     FILE* read = fdopen(client.fd, "r");
     FILE* write = fdopen(fd2, "w");
-    talk_to_client(read, write, client.dict);
+    talk_to_client(read, write, client.dict, client.stats);
     fclose(read);
     fclose(write);
-    sem_wait(client.writeProtect);
-    (*client.liveConn)--;
-    sem_post(client.writeProtect);
+    sem_wait(client.stats->writeProtect);
+    (client.stats->clientsConnected)--;
+    (client.stats->totalClients)++;
+    sem_post(client.stats->writeProtect);
     return NULL;
 }
 
@@ -403,10 +426,16 @@ void* cracking_thread(void* passed) {
 	memset(&data, 0, sizeof(struct crypt_data));
 	char* attempt = crypt_r(tools->dict[i], tools->salt, &data);
 	
+	// Update summary stats
+	sem_wait(tools->writeAccess);
+	(*(tools->cryptCalls))++;
+	sem_post(tools->writeAccess);
+
 	// If a match is found, send the result to the main thread
 	if (!strcmp(attempt, tools->encryption)) {
 	    sem_wait(tools->writeAccess);
 	    *(tools->word) = tools->dict[i];
+	    sem_post(tools->writeAccess);
 	}	
     }
     return NULL;
@@ -420,25 +449,28 @@ void* cracking_thread(void* passed) {
  *  encrypted: The string to decrypt.
  *  numThreads: The number of threads to run the encryption on.
  *  dict: The dictionary of words to test encryptions against.
+ *  stats: The summary statistics tracked by the server.
  *
  *  Returns: the decrypted word.
  *  Errors: In the event that the decryption should fail, the function returns
  *	a NULL pointer.
  */
-char* crypt_crack(char* encrypted, int numThreads, WordArray* dict) {
+char* crypt_crack(char* encrypted, int numThreads, WordArray* dict,
+	Statistics* stats) {
     // Establish variables for simpler cracking
-    sem_t writeAccess;
-    sem_init(&writeAccess, 0, 1);
+    sem_t* writeAccess = malloc(sizeof(sem_t));
+    sem_init(writeAccess, 0, 1);
     char** plaintext = malloc(sizeof(char*));
     *plaintext = NULL;
     char* salt = strndup(encrypted, 2);
     int wordsPerThread = dict->length / numThreads;
+    int cryptCalls = 0;
     pthread_t threads[numThreads];
 
     // Establish the necessary information and create each thread
     for (int i = 0; i < numThreads; i++) {
 	Cracking* tools = malloc(sizeof(Cracking));
-	tools->writeAccess = &writeAccess;
+	tools->writeAccess = writeAccess;
 	tools->word = plaintext;
 	if (i == numThreads - 1) {
 	    tools->numWords = dict->length - i * wordsPerThread;
@@ -448,6 +480,7 @@ char* crypt_crack(char* encrypted, int numThreads, WordArray* dict) {
 	tools->salt = salt;
 	tools->encryption = encrypted;
 	tools->dict = dict->words + i * wordsPerThread;
+	tools->cryptCalls = &cryptCalls;
 	pthread_create(threads + i, NULL, cracking_thread, tools);
     }
 
@@ -456,5 +489,78 @@ char* crypt_crack(char* encrypted, int numThreads, WordArray* dict) {
 	void* v;
 	pthread_join(threads[i], &v);
     }
+    sem_wait(stats->writeProtect);
+    stats->cryptFuncRequests += cryptCalls;
+    sem_post(stats->writeProtect);
     return *plaintext;
+}
+
+/* statistics_request()
+ * ---------------
+ *  Acts as a signal handling thread for outputing statistics on a SIGHUP.
+ *
+ *  stats: The statistics to be output.
+ *
+ *  Returns: NULL
+ */
+void* statistics_request(void* stats) {
+    SigHandle* sh = (SigHandle*)stats;
+    int sig;
+
+    Statistics* st = sh->stats;
+
+    while(true) {
+	sigwait(sh->set, &sig);
+	if (sig == SIGHUP) {
+	    sem_wait(st->writeProtect);
+	    fprintf(stderr, STAT_MSG, st->clientsConnected,
+		    st->totalClients, st->totalCrackRequests,
+		    st->unCrackRequests, st->succCrackRequests,
+		    st->cryptRequests, st->cryptFuncRequests);
+	    fflush(stderr);
+	    sem_post(st->writeProtect);
+	}
+    }
+    
+    return NULL;
+}
+
+/* create_stat_thread()
+ * ---------------
+ *  Prepares the thread masking and data to create the SIGHUP handling thread.
+ *
+ *  stats: The statistics to print when a SIGHUP is received. 
+ */
+void create_stat_thread(Statistics* stats) {
+    // Creates the signal mask for which the new thread will block
+    // REF: EXAMPLE section of the man page for pthread_sigmask()
+    sigset_t* set = malloc(sizeof(sigset_t));
+    sigemptyset(set);
+    sigaddset(set, SIGHUP);
+    int failure = pthread_sigmask(SIG_BLOCK, set, NULL);
+    if (failure) {
+	fprintf(stderr, "Sigmask failed.\n");
+	fflush(stderr);
+    }
+    
+    //Initialises statistics
+    sem_init(stats->writeProtect, 0, 1);
+    sem_wait(stats->writeProtect);
+    stats->clientsConnected = 0;
+    stats->totalClients = 0;
+    stats->totalCrackRequests = 0;
+    stats->succCrackRequests = 0;
+    stats->unCrackRequests = 0;
+    stats->cryptRequests = 0;
+    stats->cryptFuncRequests = 0;
+    sem_post(stats->writeProtect);
+    
+    // Prepares the information to be passed through to the thread
+    SigHandle* sh = malloc(sizeof(SigHandle));
+    sh->set = set;
+    sh->stats = stats;
+
+    // Creates the thread
+    pthread_t p;
+    pthread_create(&p, NULL, statistics_request, sh);
 }
