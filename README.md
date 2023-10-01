@@ -9,3 +9,5 @@ The course had four assignments, each with summaries included in their respectiv
 4. Network programming and multithreading.
 
 I have also included a $\LaTeX$ notebook that served as my revision / exam notes.
+
+This repository was made public at 8:45pm on October 1, 2023 (AEST).
